@@ -1,0 +1,652 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 0d6d055..3254cd0 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -220,6 +220,10 @@ file(GLOB MAIN_SRC
+     CrimsonReversedCalls.hpp
+     CrimsonSDL.cpp
+     CrimsonSDL.hpp
++    CrimsonSplitScreen.cpp
++    CrimsonSplitScreen.hpp
++    CrimsonSplitScreenTrace.cpp
++    CrimsonSplitScreenTrace.hpp
+     CrimsonTimers.cpp	
+     CrimsonTimers.hpp	
+     DebugDrawDX11.cpp
+diff --git a/src/CrimsonConfig.hpp b/src/CrimsonConfig.hpp
+index 3b427a5..089c13e 100644
+--- a/src/CrimsonConfig.hpp
++++ b/src/CrimsonConfig.hpp
+@@ -633,6 +633,10 @@ struct CrimsonConfig {
+ 
+ 		bool flipModelPresentation = true;
+ 
++		// Local multiplayer split screen (WIP). Each player gets their own viewport and camera.
++		// Only takes effect with 2+ players. See CrimsonSplitScreen.cpp.
++		bool splitScreen = false;
++
+ 		float fpsCap = 120.0f;
+ 		bool fpsUnlocked = false;
+ 
+@@ -668,6 +672,7 @@ struct CrimsonConfig {
+ 				std::make_pair("KeyboardConfig", &System::KeyboardConfig),
+ 				std::make_pair("xinputSlots", &System::xinputSlots),
+ 				std::make_pair("flipModelPresentation", &System::flipModelPresentation),
++				std::make_pair("splitScreen", &System::splitScreen),
+ 				std::make_pair("fpsCap", &System::fpsCap),
+ 				std::make_pair("fpsUnlocked", &System::fpsUnlocked),
+ 				std::make_pair("disableMenuFadeouts", &System::disableMenuFadeouts),
+diff --git a/src/CrimsonDetours.cpp b/src/CrimsonDetours.cpp
+index f768f51..9a7f47a 100644
+--- a/src/CrimsonDetours.cpp
++++ b/src/CrimsonDetours.cpp
+@@ -30,6 +30,7 @@
+ #include "Internal.hpp"
+ #include "CrimsonDetours.hpp"
+ #include "CrimsonSDL.hpp"
++#include "CrimsonSplitScreen.hpp"
+ 
+ namespace CrimsonDetours {
+ 
+@@ -1416,6 +1417,7 @@ void InitDetours() {
+ 	CameraCtrlInitDetour();
+ 	CameraSwitchInitDetour();
+ 	CameraWallCheckDetour();
++	CrimsonSplitScreen::Init();
+ 	LdkInitDetour();
+ 	CrimsonEfk::EffekInitRenderHook();
+ 	CrimsonOnTick::ToggleOnTickFuncs(true);
+diff --git a/src/CrimsonGUI.cpp b/src/CrimsonGUI.cpp
+index e89d54d..5abd72b 100644
+--- a/src/CrimsonGUI.cpp
++++ b/src/CrimsonGUI.cpp
+@@ -10546,6 +10546,19 @@ void SystemSection(size_t defaultFontSize) {
+ 			ImGui::TableNextColumn();
+ 
+ 
++			GUI_PushDisable(queuedConfig.Actor.playerCount <= 1);
++			GUI_Checkbox2("Split Screen", activeCrimsonConfig.System.splitScreen, queuedCrimsonConfig.System.splitScreen);
++			GUI_PopDisable(queuedConfig.Actor.playerCount <= 1);
++			if (ImGui::IsItemHovered()) {
++				ImGui::SetTooltip("Gives each player their own screen and camera in Multiplayer.\n"
++					"Needs 2 or more players. Both players must be in the same room.");
++			}
++			ImGui::SameLine();
++			GUI_WIPButton();
++
++			ImGui::TableNextColumn();
++
++
+ 			if (GUI_Checkbox2("Force Focus", activeConfig.forceWindowFocus, queuedConfig.forceWindowFocus)) {
+ 				ToggleForceWindowFocus(activeConfig.forceWindowFocus);
+ 			}
+diff --git a/src/CrimsonSplitScreen.cpp b/src/CrimsonSplitScreen.cpp
+new file mode 100644
+index 0000000..7e2146e
+--- /dev/null
++++ b/src/CrimsonSplitScreen.cpp
+@@ -0,0 +1,224 @@
++#include "CrimsonSplitScreen.hpp"
++
++#include <cstring>
++#include <memory>
++#include <d3d11.h>
++
++#include "Utility/Detour.hpp"
++#include "Vars.hpp"
++#include "Config.hpp"
++#include "CrimsonConfig.hpp"
++#include "Global.hpp"
++
++// =============================================================================
++// HOW TO FINISH THIS (the part that needs the game running)
++//
++// 1. Find the game function that renders the 3D scene once per frame.
++//    - Capture a frame with RenderDoc and look at the first draw call of the
++//      world (not the HUD). Walk up the call stack in x64dbg from there.
++//    - The renderer object is Devil3::sRender at dmc3.exe+C0B410 (see
++//      CrimsonEfk.cpp), and the draw wrapper at dmc3.exe+43F90 is already known.
++//      The scene function is somewhere above those.
++// 2. Put its RVA in SCENE_RENDER_OFFSET and fix SceneRenderFn to its real
++//    signature (a wrong signature breaks the call. Floats, for example, are
++//    passed in xmm registers and would be lost by the 4 pointer arguments below).
++// 3. Check the points marked UNVERIFIED below.
++// =============================================================================
++
++namespace {
++
++// RVA of the game's "render 3D scene" function. 0 = not found yet = hook is NOT installed.
++// TODO: fill in after reverse engineering (see above).
++constexpr uintptr_t SCENE_RENDER_OFFSET = 0;
++
++// TODO: replace with the real signature once known.
++using SceneRenderFn = __int64(__fastcall*)(void*, void*, void*, void*);
++
++std::unique_ptr<Utility::Detour_t> s_sceneRenderHook;
++bool s_insidePass = false; // the scene function may be re-entered by our own passes
++
++// Camera object (cCameraControl in CrimsonEfk.cpp). The pointer lives at dmc3.exe+C8FBD0.
++// Offsets taken from the static_asserts in CrimsonEfk.cpp.
++constexpr size_t CAM_STATE_BEGIN = 0x10; // up
++constexpr size_t CAM_EYE         = 0x70; // vec4
++constexpr size_t CAM_LOOKAT      = 0x80; // vec4
++constexpr size_t CAM_STATE_END   = 0x90; // everything from 0x10 to 0x90 is saved and restored
++                                         // (up, FOV, roll, transform, eye, lookat). The vtable
++                                         // pointer at 0x0 is never touched.
++
++struct CameraSnapshot {
++    uint8 bytes[CAM_STATE_END - CAM_STATE_BEGIN];
++};
++
++byte8* GetGameCamera() {
++    if (!appBaseAddr) {
++        return nullptr;
++    }
++    return *reinterpret_cast<byte8**>(appBaseAddr + 0xC8FBD0);
++}
++
++void SaveCamera(byte8* cam, CameraSnapshot& snapshot) {
++    std::memcpy(snapshot.bytes, cam + CAM_STATE_BEGIN, sizeof(snapshot.bytes));
++}
++
++void RestoreCamera(byte8* cam, const CameraSnapshot& snapshot) {
++    std::memcpy(cam + CAM_STATE_BEGIN, snapshot.bytes, sizeof(snapshot.bytes));
++}
++
++bool GetPlayerPosition(uint8 playerIndex, vec4& position) {
++    auto& playerData = GetPlayerData(playerIndex);
++    auto& newActorData = GetNewActorData(playerIndex, playerData.characterIndex, ENTITY::MAIN);
++    if (!newActorData.baseAddr) {
++        return false;
++    }
++    position = reinterpret_cast<PlayerActorData*>(newActorData.baseAddr)->position;
++    return true;
++}
++
++// Moves the camera so it frames another player the same way it frames the anchor
++// player: the offset between camera and anchor player is kept and applied to the
++// other player. Works for the third person camera (the Crimson forced TPS camera).
++// Fixed cameras (the original Capcom ones) would need their own handling.
++//
++// UNVERIFIED: this only moves eye and lookat. If the renderer builds the view matrix from
++// `transform` (cam + 0x30) instead of recomputing it from eye/lookat every frame, the
++// translation part of `transform` has to be moved too.
++void ShiftCamera(byte8* cam, const vec4& anchorPosition, const vec4& playerPosition) {
++    const float dx = playerPosition.x - anchorPosition.x;
++    const float dy = playerPosition.y - anchorPosition.y;
++    const float dz = playerPosition.z - anchorPosition.z;
++
++    auto* eye = reinterpret_cast<vec4*>(cam + CAM_EYE);
++    auto* lookat = reinterpret_cast<vec4*>(cam + CAM_LOOKAT);
++
++    eye->x += dx;
++    eye->y += dy;
++    eye->z += dz;
++
++    lookat->x += dx;
++    lookat->y += dy;
++    lookat->z += dz;
++}
++
++// The hook: draws the scene once per screen.
++//
++// KNOWN PROBLEMS to check once the hook is live:
++//  - If the scene function clears render targets / depth at its start, every pass
++//    erases the previous one (ClearRenderTargetView ignores the viewport). The clear
++//    then has to be skipped for passes after the first, or limited to the screen rect.
++//  - The game may call RSSetViewports itself inside the scene function, overriding ours.
++//    If so, hook the game's own viewport setup and replace the rect there.
++//  - UNVERIFIED: g_renderSize is used as the full size. If the 3D scene is drawn into an
++//    offscreen render target of another size (Devil3::sRender::renderTargets), use that size.
++//  - UNVERIFIED: ::D3D11::deviceContext is assumed to be the same immediate context the
++//    game renders with (Devil3::sRender::deviceContext).
++//  - The projection aspect ratio is not corrected yet (each screen is wider or narrower
++//    than the full window). Fix FOV or aspect per screen once the projection setup is found.
++__int64 __fastcall SceneRenderDetour(void* a1, void* a2, void* a3, void* a4) {
++    uintptr_t trampolineRaw = s_sceneRenderHook->GetTrampoline();
++    auto original = reinterpret_cast<SceneRenderFn>(trampolineRaw);
++
++    if (s_insidePass || !CrimsonSplitScreen::IsActive()) {
++        return original(a1, a2, a3, a4);
++    }
++
++    byte8* cam = GetGameCamera();
++    ID3D11DeviceContext* context = ::D3D11::deviceContext;
++    vec4 anchorPosition{};
++    if (!cam || !context || !GetPlayerPosition(0, anchorPosition)) {
++        return original(a1, a2, a3, a4);
++    }
++
++    const uint8 screenCount = CrimsonSplitScreen::GetScreenCount();
++
++    UINT oldViewportCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
++    D3D11_VIEWPORT oldViewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
++    context->RSGetViewports(&oldViewportCount, oldViewports);
++
++    CameraSnapshot savedCamera;
++    SaveCamera(cam, savedCamera);
++
++    __int64 result = 0;
++    s_insidePass = true;
++
++    for (uint8 screen = 0; screen < screenCount; ++screen) {
++        // Start every pass from the original camera, then move it for this player.
++        RestoreCamera(cam, savedCamera);
++
++        vec4 playerPosition{};
++        if (screen > 0 && GetPlayerPosition(screen, playerPosition)) {
++            ShiftCamera(cam, anchorPosition, playerPosition);
++        }
++
++        const auto rect = CrimsonSplitScreen::GetScreenRect(screen, screenCount, g_renderSize.x, g_renderSize.y);
++        D3D11_VIEWPORT viewport{};
++        viewport.TopLeftX = rect.x;
++        viewport.TopLeftY = rect.y;
++        viewport.Width = rect.width;
++        viewport.Height = rect.height;
++        viewport.MinDepth = 0.0f;
++        viewport.MaxDepth = 1.0f;
++        context->RSSetViewports(1, &viewport);
++
++        result = original(a1, a2, a3, a4);
++    }
++
++    s_insidePass = false;
++
++    // Leave the game exactly as it was.
++    RestoreCamera(cam, savedCamera);
++    context->RSSetViewports(oldViewportCount, oldViewports);
++
++    return result;
++}
++
++} // namespace
++
++namespace CrimsonSplitScreen {
++
++bool IsActive() {
++    return activeCrimsonConfig.System.splitScreen && activeConfig.Actor.playerCount > 1 && InGame();
++}
++
++uint8 GetScreenCount() {
++    if (!IsActive()) {
++        return 1;
++    }
++    const uint8 players = activeConfig.Actor.playerCount;
++    return (players > PLAYER_COUNT) ? PLAYER_COUNT : players;
++}
++
++ScreenRect GetScreenRect(uint8 screenIndex, uint8 screenCount, float fullWidth, float fullHeight) {
++    if (screenCount <= 1) {
++        return { 0.0f, 0.0f, fullWidth, fullHeight };
++    }
++
++    if (screenCount == 2) {
++        // top / bottom
++        const float halfHeight = fullHeight * 0.5f;
++        return { 0.0f, halfHeight * screenIndex, fullWidth, halfHeight };
++    }
++
++    // 3 or 4 screens: quadrants
++    const float halfWidth = fullWidth * 0.5f;
++    const float halfHeight = fullHeight * 0.5f;
++    const uint8 column = screenIndex % 2;
++    const uint8 row = screenIndex / 2;
++    return { halfWidth * column, halfHeight * row, halfWidth, halfHeight };
++}
++
++void Init() {
++    if (SCENE_RENDER_OFFSET == 0) {
++        Log("CrimsonSplitScreen: scene render function address not set yet, hook not installed.");
++        return;
++    }
++
++    s_sceneRenderHook = std::make_unique<Utility::Detour_t>(
++        (uintptr_t)appBaseAddr + SCENE_RENDER_OFFSET,
++        (uintptr_t)&SceneRenderDetour,
++        NULL,
++        "split_screen_scene_render");
++    s_sceneRenderHook->Toggle();
++}
++
++} // namespace CrimsonSplitScreen
+diff --git a/src/CrimsonSplitScreen.hpp b/src/CrimsonSplitScreen.hpp
+new file mode 100644
+index 0000000..d395b46
+--- /dev/null
++++ b/src/CrimsonSplitScreen.hpp
+@@ -0,0 +1,50 @@
++#pragma once
++#include "Core/Core.hpp"
++
++// =============================================================================
++// Local multiplayer split screen (WORK IN PROGRESS)
++//
++// Idea: for every frame, render the 3D scene once per player. Each pass gets
++//   1. its own viewport (a slice of the window), and
++//   2. its own camera, so that every player sees the game "as if they were
++//      player 1".
++// Game logic (CrimsonOnTick, actors, camera updates) must still run only once.
++//
++// What is done here:
++//   - the option (System.splitScreen) and its menu toggle
++//   - screen layout (1/2/3/4 screens) -> GetScreenRect()
++//   - save / move / restore of the game's camera object per pass
++//   - the render hook that repeats the scene pass
++//
++// What is NOT done yet (needs reverse engineering, see CrimsonSplitScreen.cpp):
++//   - the address (and exact signature) of the game's "render the 3D scene"
++//     function. Until SCENE_RENDER_OFFSET is filled in, Init() does nothing and
++//     the game behaves exactly as before.
++//   - aspect ratio / projection per screen
++//   - HUD, effects (Effekseer) and post processing per screen
++// =============================================================================
++
++namespace CrimsonSplitScreen {
++
++struct ScreenRect {
++    float x;
++    float y;
++    float width;
++    float height;
++};
++
++/// True when the option is on, there are 2+ players and the game is in a gameplay scene.
++bool IsActive();
++
++/// Number of screens that will be drawn this frame (1 when not active).
++uint8 GetScreenCount();
++
++/// Rectangle (in pixels, inside the full render size) used by one screen.
++/// 2 players: top / bottom. 3 or 4 players: quadrants (the 4th quadrant stays empty with 3).
++ScreenRect GetScreenRect(uint8 screenIndex, uint8 screenCount, float fullWidth, float fullHeight);
++
++/// Installs the scene render hook. Safe to call at startup: it is a no-op until
++/// the game's scene render function address is known.
++void Init();
++
++} // namespace CrimsonSplitScreen
+diff --git a/src/CrimsonSplitScreenTrace.cpp b/src/CrimsonSplitScreenTrace.cpp
+new file mode 100644
+index 0000000..c13fc21
+--- /dev/null
++++ b/src/CrimsonSplitScreenTrace.cpp
+@@ -0,0 +1,222 @@
++#ifndef _CRT_SECURE_NO_WARNINGS
++#define _CRT_SECURE_NO_WARNINGS
++#endif
++
++#include "CrimsonSplitScreenTrace.hpp"
++
++#include <windows.h>
++#include <d3d11.h>
++#include <atomic>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++
++// See the header for what this is and how to trigger it.
++
++namespace {
++
++// Slot numbers of ID3D11DeviceContext methods in its vtable
++// (3 x IUnknown + 4 x ID3D11DeviceChild + the context methods in header order).
++constexpr size_t kClearRenderTargetViewSlot = 50;
++constexpr size_t kClearDepthStencilViewSlot = 53;
++
++constexpr USHORT kMaxFrames = 24;
++constexpr int kMaxClearLogs = 16; // per kind, per recorded frame
++
++using ClearRTV_t = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11RenderTargetView*, const FLOAT[4]);
++using ClearDSV_t = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11DepthStencilView*, UINT, FLOAT, UINT8);
++
++enum State : int {
++    kIdle = 0,
++    kRecording = 1,
++};
++
++ClearRTV_t g_origClearRTV = nullptr;
++ClearDSV_t g_origClearDSV = nullptr;
++bool g_hooksInstalled = false;
++bool g_keyWasDown = false;
++std::atomic<int> g_state{kIdle};
++std::atomic<int> g_rtvLogged{0};
++std::atomic<int> g_dsvLogged{0};
++
++const char* TracePath() {
++    static char path[MAX_PATH * 2] = {};
++    static bool ready = false;
++    if (!ready) {
++        ready = true;
++        char exe[MAX_PATH] = {};
++        GetModuleFileNameA(nullptr, exe, MAX_PATH);
++        char* slash = std::strrchr(exe, '\\');
++        if (slash) {
++            *(slash + 1) = '\0';
++        }
++        std::snprintf(path, sizeof(path), "%ssplitscreen_trace.txt", exe);
++
++        FILE* test = std::fopen(path, "ab");
++        if (test) {
++            std::fclose(test);
++        } else {
++            char temp[MAX_PATH] = {};
++            GetTempPathA(MAX_PATH, temp);
++            std::snprintf(path, sizeof(path), "%ssplitscreen_trace.txt", temp);
++        }
++    }
++    return path;
++}
++
++void DescribeAddress(void* address, char* out, size_t outSize) {
++    HMODULE module = nullptr;
++    const DWORD flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
++    if (GetModuleHandleExA(flags, reinterpret_cast<LPCSTR>(address), &module) && module) {
++        char path[MAX_PATH] = {};
++        GetModuleFileNameA(module, path, MAX_PATH);
++        const char* name = std::strrchr(path, '\\');
++        name = name ? name + 1 : path;
++        const uintptr_t offset = reinterpret_cast<uintptr_t>(address) - reinterpret_cast<uintptr_t>(module);
++        std::snprintf(out, outSize, "%s+0x%llX", name, static_cast<unsigned long long>(offset));
++    } else {
++        std::snprintf(out, outSize, "unknown+0x%llX", static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(address)));
++    }
++}
++
++void WriteLine(const char* text) {
++    FILE* file = std::fopen(TracePath(), "ab");
++    if (!file) {
++        return;
++    }
++    std::fputs(text, file);
++    std::fclose(file);
++}
++
++// Writes a title line and the current call chain (most recent call first).
++void WriteStack(const char* title, const char* details) {
++    void* frames[kMaxFrames] = {};
++    const USHORT count = RtlCaptureStackBackTrace(1, kMaxFrames, frames, nullptr);
++
++    FILE* file = std::fopen(TracePath(), "ab");
++    if (!file) {
++        return;
++    }
++    std::fprintf(file, "\n[%s] %s (thread %lu)\n", title, details, static_cast<unsigned long>(GetCurrentThreadId()));
++    for (USHORT i = 0; i < count; ++i) {
++        char description[MAX_PATH + 40] = {};
++        DescribeAddress(frames[i], description, sizeof(description));
++        std::fprintf(file, "  #%02u %s\n", static_cast<unsigned>(i), description);
++    }
++    std::fclose(file);
++}
++
++void STDMETHODCALLTYPE HookClearRenderTargetView(
++    ID3D11DeviceContext* self, ID3D11RenderTargetView* view, const FLOAT color[4]) {
++    if (g_state.load() == kRecording) {
++        const int index = g_rtvLogged.fetch_add(1);
++        if (index < kMaxClearLogs) {
++            UINT viewportCount = 1;
++            D3D11_VIEWPORT viewport = {};
++            self->RSGetViewports(&viewportCount, &viewport);
++
++            char details[160] = {};
++            std::snprintf(details, sizeof(details), "ClearRenderTargetView #%d color=(%.2f %.2f %.2f %.2f) viewport=%.0fx%.0f",
++                index, color ? color[0] : 0.0f, color ? color[1] : 0.0f, color ? color[2] : 0.0f, color ? color[3] : 0.0f,
++                viewport.Width, viewport.Height);
++            WriteStack("Clear", details);
++        }
++    }
++    g_origClearRTV(self, view, color);
++}
++
++void STDMETHODCALLTYPE HookClearDepthStencilView(
++    ID3D11DeviceContext* self, ID3D11DepthStencilView* view, UINT flags, FLOAT depth, UINT8 stencil) {
++    if (g_state.load() == kRecording) {
++        const int index = g_dsvLogged.fetch_add(1);
++        if (index < kMaxClearLogs) {
++            char details[160] = {};
++            std::snprintf(details, sizeof(details), "ClearDepthStencilView #%d flags=%u depth=%.2f stencil=%u",
++                index, flags, depth, static_cast<unsigned>(stencil));
++            WriteStack("Clear", details);
++        }
++    }
++    g_origClearDSV(self, view, flags, depth, stencil);
++}
++
++void WriteSlot(void** vtable, size_t slot, void* value) {
++    DWORD oldProtect = 0;
++    VirtualProtect(&vtable[slot], sizeof(void*), PAGE_READWRITE, &oldProtect);
++    vtable[slot] = value;
++    VirtualProtect(&vtable[slot], sizeof(void*), oldProtect, &oldProtect);
++}
++
++bool InstallHooks(IDXGISwapChain* swapChain) {
++    if (!swapChain) {
++        return false;
++    }
++
++    ID3D11Device* device = nullptr;
++    if (FAILED(swapChain->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&device))) || !device) {
++        return false;
++    }
++    ID3D11DeviceContext* context = nullptr;
++    device->GetImmediateContext(&context);
++    device->Release();
++    if (!context) {
++        return false;
++    }
++
++    void** vtable = *reinterpret_cast<void***>(context);
++
++    // Remember the originals first, so the hooks always have somewhere to forward to.
++    g_origClearRTV = reinterpret_cast<ClearRTV_t>(vtable[kClearRenderTargetViewSlot]);
++    g_origClearDSV = reinterpret_cast<ClearDSV_t>(vtable[kClearDepthStencilViewSlot]);
++    if (!g_origClearRTV || !g_origClearDSV) {
++        context->Release();
++        return false;
++    }
++
++    WriteSlot(vtable, kClearRenderTargetViewSlot, reinterpret_cast<void*>(&HookClearRenderTargetView));
++    WriteSlot(vtable, kClearDepthStencilViewSlot, reinterpret_cast<void*>(&HookClearDepthStencilView));
++
++    context->Release();
++    return true;
++}
++
++} // namespace
++
++namespace CrimsonSplitScreenTrace {
++
++void OnPresent(IDXGISwapChain* swapChain) {
++    const bool down = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_F9) & 0x8000);
++    const bool pressed = down && !g_keyWasDown;
++    g_keyWasDown = down;
++
++    if (g_state.load() == kRecording) {
++        // This Present ends the frame that was being recorded.
++        WriteStack("Present", "end of the recorded frame");
++        WriteLine("\n=== trace end ===\n");
++        g_state.store(kIdle);
++        return;
++    }
++
++    if (!pressed) {
++        return;
++    }
++
++    char header[256] = {};
++    const uintptr_t exeBase = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
++    std::snprintf(header, sizeof(header), "\n=== trace start === (dmc3.exe loaded at 0x%llX)\n",
++        static_cast<unsigned long long>(exeBase));
++    WriteLine(header);
++
++    if (!g_hooksInstalled) {
++        g_hooksInstalled = InstallHooks(swapChain);
++        if (!g_hooksInstalled) {
++            WriteLine("Could not install the hooks. Nothing was recorded.\n=== trace end ===\n");
++            return;
++        }
++    }
++
++    g_rtvLogged.store(0);
++    g_dsvLogged.store(0);
++    g_state.store(kRecording);
++}
++
++} // namespace CrimsonSplitScreenTrace
+diff --git a/src/CrimsonSplitScreenTrace.hpp b/src/CrimsonSplitScreenTrace.hpp
+new file mode 100644
+index 0000000..3accc4f
+--- /dev/null
++++ b/src/CrimsonSplitScreenTrace.hpp
+@@ -0,0 +1,26 @@
++#pragma once
++#include <dxgi.h>
++
++// =============================================================================
++// Split screen DIAGNOSTIC (temporary tool, does nothing until you ask it to)
++//
++// Goal: find the game function that renders a whole frame, so the split screen
++// can call it once per player. RenderDoc could not give us the call chain
++// (no symbols for dmc3.exe), so the mod records it itself.
++//
++// How to use: in game, hold CTRL and press F9 once. The mod then records the next
++// frame and writes the result to splitscreen_trace.txt, next to dmc3.exe
++// (or in your Windows temp folder if the game folder is not writable).
++//
++// What is recorded (each one as a list of "module+offset" addresses):
++//   - the first calls to ClearRenderTargetView / ClearDepthStencilView of the frame
++//   - the call to Present at the end of the frame
++// Nothing is hooked until the hotkey is pressed for the first time.
++// =============================================================================
++
++namespace CrimsonSplitScreenTrace {
++
++/// Call at the very start of the Present hook, with the game's swap chain.
++void OnPresent(IDXGISwapChain* swapChain);
++
++} // namespace CrimsonSplitScreenTrace
+diff --git a/src/Global/HooksBase.hpp b/src/Global/HooksBase.hpp
+index 5efe598..b5cc59d 100644
+--- a/src/Global/HooksBase.hpp
++++ b/src/Global/HooksBase.hpp
+@@ -21,6 +21,7 @@
+ #include "../StyleSwitchFX.hpp"
+ #include "../CrimsonSDL.hpp"
+ #include "../CrimsonEfk.hpp"
++#include "../CrimsonSplitScreenTrace.hpp"
+ 
+ namespace API {
+ enum {
+@@ -205,6 +206,11 @@ template <new_size_t api> HRESULT Present(IDXGISwapChain* pSwapChain, UINT SyncI
+         }
+     }
+ 
++    // Split screen diagnostic: does nothing unless CTRL+F9 is pressed (see CrimsonSplitScreenTrace.hpp).
++    if constexpr (api == API::D3D11) {
++        CrimsonSplitScreenTrace::OnPresent(pSwapChain);
++    }
++
+     // Note: Advanced frame latency waitable object optimization is implemented
+     // in the D3D11CreateDeviceAndSwapChain function for DXGI 1.2+ compatibility
+ 
