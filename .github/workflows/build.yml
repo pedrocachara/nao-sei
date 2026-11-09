@@ -5,7 +5,7 @@ name: Build Crimson (split screen)
 #
 # This repository only needs two things:
 #   1. this file, at .github/workflows/build.yml
-#   2. crimson-splitscreen.patch, in the root of the repository
+#   2. a crimson-splitscreen*.patch file, in the root of the repository (the newest version is used)
 # The Crimson source code itself is downloaded from berthrage/DMC3-Crimson on every run.
 
 on:
@@ -39,16 +39,24 @@ jobs:
           ref: ${{ inputs.ref }}
           path: crimson
 
+      # Uses the patch with the highest version in the root of this repository
+      # (crimson-splitscreen-v2.patch beats crimson-splitscreen.patch, v3 beats v2, ...).
       - name: Apply the split screen patch
         shell: bash
         working-directory: crimson
         run: |
-          if [ ! -f ../mine/crimson-splitscreen.patch ]; then
-            echo "::error::crimson-splitscreen.patch was not found in the root of this repository. Upload it and run again."
+          patch=$(find ../mine -maxdepth 1 -name 'crimson-splitscreen-v*.patch' | sort -V | tail -n 1)
+          if [ -z "$patch" ] && [ -f ../mine/crimson-splitscreen.patch ]; then
+            patch=../mine/crimson-splitscreen.patch
+          fi
+          if [ -z "$patch" ]; then
+            echo "::error::No crimson-splitscreen*.patch file was found in the root of this repository. Upload it and run again."
             exit 1
           fi
-          git apply --check ../mine/crimson-splitscreen.patch
-          git apply ../mine/crimson-splitscreen.patch
+          echo "Using patch: $patch"
+          echo "PATCH_NAME=$(basename "$patch")" >> "$GITHUB_ENV"
+          git apply --check "$patch"
+          git apply "$patch"
           git status --short
 
       - name: Configure (CMake)
@@ -78,7 +86,7 @@ jobs:
           {
             echo "Crimson version built: $REF"
             echo "Source commit: $(git -C crimson rev-parse HEAD)"
-            echo "Patch: crimson-splitscreen.patch applied"
+            echo "Patch applied: $PATCH_NAME"
           } > out/BUILDINFO.txt
           ls -la out
 
