@@ -1,0 +1,90 @@
+name: Build Crimson (split screen)
+
+# Compiles DMC3 Crimson on a GitHub Windows machine, with the split screen patch applied,
+# and hands you the DLLs as a download. Nothing needs to be installed on your PC.
+#
+# This repository only needs two things:
+#   1. this file, at .github/workflows/build.yml
+#   2. crimson-splitscreen.patch, in the root of the repository
+# The Crimson source code itself is downloaded from berthrage/DMC3-Crimson on every run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Crimson version to build (a tag like V0.5a, or a branch like main)"
+        required: true
+        default: "V0.5a"
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    steps:
+      # Keep line endings as LF everywhere, otherwise the patch may not match the files.
+      - name: Keep LF line endings
+        shell: bash
+        run: git config --global core.autocrlf false
+
+      - name: Get this repository (the patch lives here)
+        uses: actions/checkout@v4
+        with:
+          path: mine
+
+      - name: Get the Crimson source code
+        uses: actions/checkout@v4
+        with:
+          repository: berthrage/DMC3-Crimson
+          ref: ${{ inputs.ref }}
+          path: crimson
+
+      - name: Apply the split screen patch
+        shell: bash
+        working-directory: crimson
+        run: |
+          if [ ! -f ../mine/crimson-splitscreen.patch ]; then
+            echo "::error::crimson-splitscreen.patch was not found in the root of this repository. Upload it and run again."
+            exit 1
+          fi
+          git apply --check ../mine/crimson-splitscreen.patch
+          git apply ../mine/crimson-splitscreen.patch
+          git status --short
+
+      - name: Configure (CMake)
+        shell: bash
+        working-directory: crimson
+        run: cmake -S . -B "VS2022 x64" -G "Visual Studio 17 2022" -A x64
+
+      - name: Build (Release)
+        shell: bash
+        working-directory: crimson
+        run: cmake --build "VS2022 x64" --config Release --target Crimson dinput8_injector --parallel
+
+      - name: Collect the DLLs
+        shell: bash
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          mkdir -p out
+          for name in Crimson.dll dinput8_injector.dll; do
+            found=$(find crimson -name "$name" -path "*Release*" | head -n 1)
+            if [ -z "$found" ]; then
+              echo "::error::$name was not produced by the build."
+              exit 1
+            fi
+            cp "$found" out/
+          done
+          {
+            echo "Crimson version built: $REF"
+            echo "Source commit: $(git -C crimson rev-parse HEAD)"
+            echo "Patch: crimson-splitscreen.patch applied"
+          } > out/BUILDINFO.txt
+          ls -la out
+
+      - name: Upload the result
+        uses: actions/upload-artifact@v4
+        with:
+          name: Crimson-splitscreen-${{ inputs.ref }}
+          path: out/
+          if-no-files-found: error
